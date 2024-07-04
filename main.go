@@ -124,6 +124,9 @@ func startSniProxy() {
 func serve(c net.Conn, raddr string) {
 	defer c.Close()
 
+	// 设置连接超时
+	c.SetDeadline(time.Now().Add(30 * time.Second))
+
 	buf := make([]byte, 2048) // 分配缓冲区
 	n, err := c.Read(buf)     // 读入新连接的内容
 	if err != nil && fmt.Sprintf("%v", err) != "EOF" {
@@ -155,312 +158,67 @@ func serve(c net.Conn, raddr string) {
 // 获取 SNI 域名
 func getSNIServerName(buf []byte) string {
 	n := len(buf)
-	if n < 5 {
-		serviceLogger("不是 TLS 握手消息", 31, true)
-		return ""
+	for i := 0; i < n; i++ {
+		if i+4 < n && buf[i] == 0x00 && buf[i+1] == 0x00 && buf[i+2] == 0x00 && buf[i+3] == 0x00 && buf[i+4] == 0x00 {
+			// SNI start point
+			offset := i + 5
+			length := int(buf[offset])
+			if offset+length < n {
+				return string(buf[offset+1 : offset+1+length])
+			}
+		}
 	}
-
-	// TLS 记录类型
-	if recordType(buf[0]) != recordTypeHandshake {
-		serviceLogger("不是 TLS", 31, true)
-		return ""
-	}
-
-	// TLS 主要版本
-	if buf[1] != 3 {
-		serviceLogger("不支持 TLS 版本 < 3", 31, true)
-		return ""
-	}
-
-	// payload 长度
-	//l := int(buf[3])<<16 + int(buf[4])
-	//log.Printf("length: %d, got: %d", l, n)
-
-	// 握手消息类型
-	if buf[5] != typeClientHello {
-		serviceLogger("不是 Client Hello 消息", 31, true)
-		return ""
-	}
-
-	// 以下开始解析 Client Hello 消息
-	msg := &clientHelloMsg{}
-	// Client Hello 不包含 TLS 标头, 5 字节
-	ret := msg.unmarshal(buf[5:n])
-	if !ret {
-		serviceLogger("解析 Client Hello 消息失败", 31, true)
-		return ""
-	}
-	return msg.serverName
+	return ""
 }
 
-// forward 函数接收一个 net.Conn 类型的连接对象 conn、一个 []byte 类型的数据 data、一个目标地址 dst、一个来源地址 raddr
-// 该函数使用 GetDialer 函数创建一个与目标地址 dst 的后端连接 backend，将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
-func forward(conn net.Conn, data []byte, dst string, raddr string) {
-	backend, err := GetDialer(cfg.EnableSocks).Dial("tcp", dst)
+// 转发连接
+func forward(src net.Conn, firstPayload []byte, dstAddr, raddr string) {
+	dst, err := net.Dial("tcp", dstAddr)
 	if err != nil {
-		serviceLogger(fmt.Sprintf("无法连接到后端, %v", err), 31, false)
+		serviceLogger(fmt.Sprintf("连接目标 %s 时出错: %v", dstAddr, err), 31, false)
+		return
+	}
+	defer dst.Close()
+
+	// 设置目标连接超时
+	dst.SetDeadline(time.Now().Add(30 * time.Second))
+
+	_, err = dst.Write(firstPayload)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("向目标 %s 发送初始数据时出错: %v", dstAddr, err), 31, false)
 		return
 	}
 
-	defer backend.Close()
+	// 使用 io.Copy 并发地将数据从源连接传输到目标连接
+	go func() {
+		_, err := io.Copy(dst, src)
+		if err != nil {
+			serviceLogger(fmt.Sprintf("将数据从源 %s 复制到目标 %s 时出错: %v", raddr, dstAddr, err), 31, false)
+		}
+		dst.Close()
+		src.Close()
+	}()
 
-	if _, err = backend.Write(data); err != nil {
-		serviceLogger(fmt.Sprintf("无法传输到后端, %v", err), 31, false)
+	_, err = io.Copy(src, dst)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("将数据从目标 %s 复制到源 %s 时出错: %v", dstAddr, raddr, err), 31, false)
+	}
+}
+
+// 服务日志
+func serviceLogger(message string, colorCode int, debugOnly bool) {
+	if debugOnly && !EnableDebug {
 		return
 	}
-
-	conChk := make(chan int)
-	go ioReflector(backend, conn, false, conChk, raddr, dst)
-	go ioReflector(conn, backend, true, conChk, raddr, dst)
-	<-conChk
-}
-
-// ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、一个 chan int 类型的 conChk，以及两个字符串类型的 raddr 和 dsts
-// 该函数使用 io.Copy 函数将 src 中读取到的数据流复制到 dst 中，然后将转发的字节数写入日志
-// 最后，该函数关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
-func ioReflector(dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan int, raddr string, dsts string) {
-	// 将 IO 流反映到另一个
-	defer onDisconnect(dst, conChk)
-	written, _ := io.Copy(dst, src)
-	if isToClient {
-		serviceLogger(fmt.Sprintf("[%v] -> [%v] %d bytes", dsts, raddr, written), 33, true)
-	} else {
-		serviceLogger(fmt.Sprintf("[%v] -> [%v] %d bytes", raddr, dsts, written), 33, true)
-	}
-	dst.Close()
-	conChk <- 1
-}
-
-// onDisconnect 函数接收一个 io.WriteCloser 类型的写入对象 dst 和一个 chan int 类型的 conChk
-// 该函数在 dst 连接关闭时被调用，并向 conChk 通道发送一个信号以表示连接已关闭
-func onDisconnect(dst io.WriteCloser, conChk chan int) {
-	// 关闭时 -> 强制断开另一对连接
-	dst.Close()
-	conChk <- 1
-}
-
-// 解析 Client Hello 消息
-func (m *clientHelloMsg) unmarshal(data []byte) bool {
-	if len(data) < 42 {
-		return false
-	}
-	m.raw = data
-	m.vers = uint16(data[4])<<8 | uint16(data[5])
-	m.random = data[6:38]
-	sessionIDLen := int(data[38])
-	if sessionIDLen > 32 || len(data) < 39+sessionIDLen {
-		return false
-	}
-	m.sessionID = data[39 : 39+sessionIDLen]
-	data = data[39+sessionIDLen:]
-	if len(data) < 2 {
-		return false
-	}
-	// cipherSuiteLen 是密码套件编号的字节数。由于是 uint16，因此数字必须是偶数
-	cipherSuiteLen := int(data[0])<<8 | int(data[1])
-	if cipherSuiteLen%2 == 1 || len(data) < 2+cipherSuiteLen {
-		return false
-	}
-	numCipherSuites := cipherSuiteLen / 2
-	m.cipherSuites = make([]uint16, numCipherSuites)
-	for i := 0; i < numCipherSuites; i++ {
-		m.cipherSuites[i] = uint16(data[2+2*i])<<8 | uint16(data[3+2*i])
-		if m.cipherSuites[i] == scsvRenegotiation {
-			m.secureRenegotiationSupported = true
-		}
-	}
-	data = data[2+cipherSuiteLen:]
-	if len(data) < 1 {
-		return false
-	}
-	compressionMethodsLen := int(data[0])
-	if len(data) < 1+compressionMethodsLen {
-		return false
-	}
-	m.compressionMethods = data[1 : 1+compressionMethodsLen]
-
-	data = data[1+compressionMethodsLen:]
-
-	m.nextProtoNeg = false
-	m.serverName = ""
-	m.ocspStapling = false
-	m.ticketSupported = false
-	m.sessionTicket = nil
-	m.signatureAndHashes = nil
-	m.alpnProtocols = nil
-	m.scts = false
-
-	if len(data) == 0 {
-		// ClientHello 后面可选地跟着扩展数据
-		return true
-	}
-	if len(data) < 2 {
-		return false
-	}
-
-	extensionsLength := int(data[0])<<8 | int(data[1])
-	data = data[2:]
-	if extensionsLength != len(data) {
-		return false
-	}
-
-	for len(data) != 0 {
-		if len(data) < 4 {
-			return false
-		}
-		extension := uint16(data[0])<<8 | uint16(data[1])
-		length := int(data[2])<<8 | int(data[3])
-		data = data[4:]
-		if len(data) < length {
-			return false
-		}
-
-		switch extension {
-		case extensionServerName:
-			d := data[:length]
-			if len(d) < 2 {
-				return false
-			}
-			namesLen := int(d[0])<<8 | int(d[1])
-			d = d[2:]
-			if len(d) != namesLen {
-				return false
-			}
-			for len(d) > 0 {
-				if len(d) < 3 {
-					return false
-				}
-				nameType := d[0]
-				nameLen := int(d[1])<<8 | int(d[2])
-				d = d[3:]
-				if len(d) < nameLen {
-					return false
-				}
-				if nameType == 0 {
-					m.serverName = string(d[:nameLen])
-					// SNI 值末尾不能有点
-					if strings.HasSuffix(m.serverName, ".") {
-						return false
-					}
-					break
-				}
-				d = d[nameLen:]
-			}
-		case extensionNextProtoNeg:
-			if length > 0 {
-				return false
-			}
-			m.nextProtoNeg = true
-		case extensionStatusRequest:
-			m.ocspStapling = length > 0 && data[0] == statusTypeOCSP
-		case extensionSupportedCurves:
-			// http://tools.ietf.org/html/rfc4492#section-5.5.1
-			if length < 2 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l%2 == 1 || length != l+2 {
-				return false
-			}
-			numCurves := l / 2
-			m.supportedCurves = make([]CurveID, numCurves)
-			d := data[2:]
-			for i := 0; i < numCurves; i++ {
-				m.supportedCurves[i] = CurveID(d[0])<<8 | CurveID(d[1])
-				d = d[2:]
-			}
-		case extensionSupportedPoints:
-			// http://tools.ietf.org/html/rfc4492#section-5.5.2
-			if length < 1 {
-				return false
-			}
-			l := int(data[0])
-			if length != l+1 {
-				return false
-			}
-			m.supportedPoints = make([]uint8, l)
-			copy(m.supportedPoints, data[1:])
-		case extensionSessionTicket:
-			// http://tools.ietf.org/html/rfc5077#section-3.2
-			m.ticketSupported = true
-			m.sessionTicket = data[:length]
-		case extensionSignatureAlgorithms:
-			// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
-			if length < 2 || length&1 != 0 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l != length-2 {
-				return false
-			}
-			n := l / 2
-			d := data[2:]
-			m.signatureAndHashes = make([]signatureAndHash, n)
-			for i := range m.signatureAndHashes {
-				m.signatureAndHashes[i].hash = d[0]
-				m.signatureAndHashes[i].signature = d[1]
-				d = d[2:]
-			}
-		case extensionRenegotiationInfo:
-			if length == 0 {
-				return false
-			}
-			d := data[:length]
-			l := int(d[0])
-			d = d[1:]
-			if l != len(d) {
-				return false
-			}
-
-			m.secureRenegotiation = d
-			m.secureRenegotiationSupported = true
-		case extensionALPN:
-			if length < 2 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l != length-2 {
-				return false
-			}
-			d := data[2:length]
-			for len(d) != 0 {
-				stringLen := int(d[0])
-				d = d[1:]
-				if stringLen == 0 || stringLen > len(d) {
-					return false
-				}
-				m.alpnProtocols = append(m.alpnProtocols, string(d[:stringLen]))
-				d = d[stringLen:]
-			}
-		case extensionSCT:
-			m.scts = true
-			if length != 0 {
-				return false
-			}
-		}
-		data = data[length:]
-	}
-
-	return true
-}
-
-// 输出日志
-func serviceLogger(log string, color int, isDebug bool) {
-	if isDebug && !EnableDebug {
-		return
-	}
-	log = strings.Replace(log, "\n", "", -1)
-	log = strings.Join([]string{time.Now().Format("2006/01/02 15:04:05"), " ", log}, "")
-	if color == 0 {
-		fmt.Printf("%s\n", log)
-	} else {
-		fmt.Printf("%c[1;0;%dm%s%c[0m\n", 0x1B, color, log, 0x1B)
-	}
+	fmt.Printf("\x1b[%dm%s\x1b[0m\n", colorCode, message)
 	if LogFilePath != "" {
-		fd, _ := os.OpenFile(LogFilePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-		fdContent := strings.Join([]string{log, "\n"}, "")
-		buf := []byte(fdContent)
-		fd.Write(buf)
-		fd.Close()
+		file, err := os.OpenFile(LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			fmt.Printf("无法写入日志文件: %v\n", err)
+			return
+		}
+		defer file.Close()
+		logger := io.MultiWriter(os.Stdout, file)
+		fmt.Fprintf(logger, "%s\n", message)
 	}
 }
